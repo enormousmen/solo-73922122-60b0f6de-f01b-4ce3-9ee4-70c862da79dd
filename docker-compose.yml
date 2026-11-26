@@ -1,0 +1,64 @@
+services:
+  sample-upstream:
+    build: .
+    image: dns-stale-fallback-demo:1.0
+    command: ["python", "-m", "app.upstream"]
+    environment:
+      UPSTREAM_DNS_HOST: "0.0.0.0"
+      UPSTREAM_DNS_PORT: "5353"
+      API_HOST: "0.0.0.0"
+      API_PORT: "8000"
+    ports:
+      # FastAPI admin/control interface
+      - "127.0.0.1:8000:8000"
+    expose:
+      - "5353/udp"
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).status == 200 else 1)"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+
+  dns-forwarder:
+    build: .
+    image: dns-stale-fallback-demo:1.0
+    command: ["python", "-m", "app.forwarder"]
+    environment:
+      DNS_LISTEN_HOST: "0.0.0.0"
+      DNS_LISTEN_PORT: "53"
+      UPSTREAM_DNS_HOST: "sample-upstream"
+      UPSTREAM_DNS_PORT: "5353"
+      # 需求规定的三个关键计时参数（毫秒 / 秒）
+      STALE_AFTER_MS: "100"
+      UPSTREAM_TIMEOUT_MS: "1000"
+      STALE_GRACE_S: "30"
+    ports:
+      # 标准 DNS 端口（仅绑回环；若本机 53 被占用，可删除本行或设 DNS_HOST_PORT）
+      - "127.0.0.1:53:53/udp"
+      # 免冲突备用端口：宿主机 127.0.0.1:5354 -> 容器 53/udp
+      - "127.0.0.1:5354:53/udp"
+    depends_on:
+      sample-upstream:
+        condition: service_healthy
+
+  # 可选的一键演示容器：docker compose --profile demo run --rm demo
+  demo:
+    build: .
+    image: dns-stale-fallback-demo:1.0
+    profiles: ["demo"]
+    depends_on:
+      - dns-forwarder
+      - sample-upstream
+    environment:
+      DNS_HOST: "dns-forwarder"
+      DNS_PORT: "53"
+      API_BASE: "http://sample-upstream:8000"
+      PYTHONPATH: "/srv"
+    volumes:
+      - ./scripts:/scripts:ro
+    command: ["python", "/scripts/demo.py"]
