@@ -28,6 +28,8 @@ from dns_client import format_result, query_once  # noqa: E402
 
 DNS_HOST = os.environ.get("DNS_HOST", "127.0.0.1")
 DNS_PORT = int(os.environ.get("DNS_PORT", "5354"))
+# 短宽限（grace=1s、总限时 400ms）转发器实例，compose 映射在 5355。
+FAST_DNS_PORT = int(os.environ.get("FAST_DNS_PORT", "5355"))
 API_BASE = os.environ.get("API_BASE", "http://127.0.0.1:8000")
 
 OLD_IP = "203.0.113.10"
@@ -56,10 +58,12 @@ def title(text: str) -> None:
     print("=" * 76)
 
 
-def dig(name: str, qtype: str = "A", timeout: float = 2.0, quiet: bool = False) -> dict:
-    result = query_once(name, qtype, server=DNS_HOST, port=DNS_PORT, timeout=timeout)
+def dig(name: str, qtype: str = "A", timeout: float = 2.0, quiet: bool = False,
+        port: int | None = None) -> dict:
+    target_port = DNS_PORT if port is None else port
+    result = query_once(name, qtype, server=DNS_HOST, port=target_port, timeout=timeout)
     if not quiet:
-        print("  $ dig @%s -p %s %s %s" % (DNS_HOST, DNS_PORT, name, qtype))
+        print("  $ dig @%s -p %s %s %s" % (DNS_HOST, target_port, name, qtype))
         print("  " + format_result(name, qtype, result))
     return result
 
@@ -132,8 +136,51 @@ def main() -> int:
     r8 = dig(name, "AAAA")
     assert r8["ok"] and r8["rcode"] == 5, r8
 
+    title("9) SERVFAIL 后立即重查同一域名：新查询立即重新回源，不继承死航班")
+    retry_name = f"retry-{run_id}.local"
+    api("DELETE", "/admin/requests")
+    api("POST", "/admin/silence", {"silence": True})
+    t0 = time.monotonic()
+    r9a = dig(retry_name, timeout=2.0)
+    print(f"  首轮等待 {(time.monotonic() - t0) * 1000:.0f}ms（应接近 1000ms）")
+    assert r9a["ok"] and r9a["rcode"] == 2, r9a
+    reqs = api("GET", f"/admin/requests?qname={retry_name}.&limit=50")
+    assert reqs["count"] == 1, reqs  # 首轮只发了一个回源包
+
+    # 上游恢复并改答；重查必须重新发包，而不是沿用已到点的旧航班直接报错。
+    api("POST", "/admin/answer", {"qname": retry_name, "ip": NEW_IP, "ttl": 30})
+    api("POST", "/admin/resume")
+    t0 = time.monotonic()
+    r9b = dig(retry_name, timeout=2.0)
+    retry_ms = (time.monotonic() - t0) * 1000
+    print(f"  立即重查耗时 {retry_ms:.0f}ms（应快速成功，不再等 1s）")
+    assert r9b["ok"] and r9b["answers"][0]["ip"] == NEW_IP, r9b
+    assert retry_ms < 300, retry_ms
+    reqs = api("GET", f"/admin/requests?qname={retry_name}.&limit=50")
+    print(f"  上游同域名查询包数量 = {reqs['count']}（重查触发了第 2 次回源）")
+    assert reqs["count"] == 2, reqs
+
+    title("10) 等待回源期间旧址越过 30s 宽限（短宽限实例 grace=1s）："
+          "不再回旧址，继续等原回源直到 400ms 总限时 -> SERVFAIL")
+    grace_name = f"grace-{run_id}.local"
+    api("POST", "/admin/answer", {"qname": grace_name, "ip": OLD_IP, "ttl": 1})
+    api("POST", "/admin/resume")
+    r10a = dig(grace_name, port=FAST_DNS_PORT)
+    assert r10a["answers"][0]["ip"] == OLD_IP, r10a
+    # 等 TTL(1s) 到期，并让查询发起时旧址仍在 1s 宽限内、等待中越过宽限。
+    time.sleep(1.95)
+    api("POST", "/admin/silence", {"silence": True})
+    t0 = time.monotonic()
+    r10 = dig(grace_name, timeout=2.0, port=FAST_DNS_PORT)
+    grace_ms = (time.monotonic() - t0) * 1000
+    api("POST", "/admin/resume")
+    print(f"  等待 {grace_ms:.0f}ms 后返回 {r10['rcode_name']}（旧址宽限在等待中耗尽）")
+    assert r10["ok"] and r10["rcode"] == 2 and not r10["answers"], r10
+    assert grace_ms >= 320, grace_ms  # 等满 400ms 总限时，而不是 100ms 回旧址
+
     print("\n演示完成：先收到 TTL=0 旧址，恢复改答后查到新址；"
-          "并发单回源、SERVFAIL、NXDOMAIN、REFUSED 均符合预期。")
+          "并发单回源、SERVFAIL 后立即重查重新回源、等待中旧址失效继续等、"
+          "NXDOMAIN、REFUSED 均符合预期。")
     return 0
 
 

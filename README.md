@@ -22,11 +22,23 @@
 1. **缓存新鲜**（年龄 < 上游 TTL）：直接回答，TTL 按已缓存时间递减。
 2. **缓存缺失或到期**：加入/启动该域名唯一的一次回源（single-flight）。
 3. 回源满 **100ms** 仍无成功/明确应答，且存在过期未超过 **30s** 的旧址：
-   立即回 `NOERROR + 旧址 A 记录，TTL=0`。
+   立即回 `NOERROR + 旧址 A 记录，TTL=0`。是否可回旧址在**每个决策点重新读取缓存**：
+   若等待期间旧址越过 30s 宽限（或被 NXDOMAIN 清除），则不再回旧址，继续等同一回源，
+   到总限时回 `SERVFAIL`。
 4. 旧址回包后，共享回源任务**不取消**，继续到 **1s** 总限时；期间若上游应答则按上游 TTL 刷新缓存，供后续查询使用。
 5. 没有可用旧址（从未查到、过期超过 30s、或被 NXDOMAIN 清除）：等待回源，满 **1s** 仍失败回 `SERVFAIL`。
 6. 上游回 `NXDOMAIN`：立即删除该域名旧址并回 NXDOMAIN。
-7. 只有上游 TTL>0 的 A 应答才入缓存；回源超时/网络错误**不写缓存、不更新 `fetched_at`**，因此不会给旧址续期。
+7. 只有上游 TTL>0 的 A 应答才入缓存；**超时轮次的迟到应答（无论 NOERROR/NXDOMAIN）一律丢弃，
+   不写缓存、不清缓存、不更新 `fetched_at`**，因此不会给旧址续期，也不会误删旧址。
+
+### 回源计时与航班（flight）生命周期
+
+- **1s 总时限从发起回源那一刻起算**：创建上游 UDP 端点（`create_datagram_endpoint`）的耗时也计入；
+  端点建好后只拿剩余预算等待回包，剩余预算 ≤ 0 立即结束本轮。
+- 到点仍无有效应答，本轮立即结束：到达该航班硬截止的查询回 `SERVFAIL`（或 TTL0 旧址），
+  航班标记为 `expired`。旧任务可能还在后台收尾，但**同名新查询会立即开新航班、重新发包**，
+  不会继承死航班而“不发包就再报错”。
+- 旧航班收尾时只在它仍占用登记位时移除自己，因此不会干扰已经开始的新一轮。
 
 同一域名的 8 个并发到期查询实测只产生 **1** 个上游 UDP 包，8 个客户端都在 ~100ms 收到 TTL=0 旧址。
 
@@ -51,8 +63,8 @@ scripts/
 tests/
   test_dns_codec.py     # 编解码单测（装了 dnspython 时做互通校验）
   test_cache.py         # TTL / 30s 边界 / NXDOMAIN 删除
-  test_resolver.py      # single-flight / stale / 超时 / 失败处理
-  selftest_e2e.py       # 起真实子进程的端到端自测（31 项断言）
+  test_resolver.py      # single-flight / stale / 超时 / 失败 / 迟答丢弃 / 立即重查 / 宽限等待
+  selftest_e2e.py       # 起真实子进程的端到端自测（39 项断言）
 docker-compose.yml
 Dockerfile
 requirements.txt
@@ -81,6 +93,7 @@ docker compose down
 | --- | --- | --- |
 | `127.0.0.1:53/udp` | `dns-forwarder:53/udp` | DNS 查询入口（标准端口，`dig @127.0.0.1`） |
 | `127.0.0.1:5354/udp` | `dns-forwarder:53/udp` | 同一入口的免冲突备用映射（`dig -p 5354`） |
+| `127.0.0.1:5355/udp` | `dns-forwarder-fast:53/udp` | 短宽限演示实例（总限时 400ms、grace 1s），演示等待中旧址失效 |
 | `127.0.0.1:8000/tcp` | `sample-upstream:8000/tcp` | FastAPI 管控 API |
 
 两个 UDP 映射指向同一服务，用任一端口查询均可。若本机 `127.0.0.1:53` 已被
@@ -237,15 +250,17 @@ curl-demo.local A: NOERROR 198.51.100.77 ttl=60 (2ms)
 # 转发器与测试本身只用标准库；若要在本机起 FastAPI 上游，先装依赖：
 python3 -m pip install -r requirements.txt
 
-python3 -m unittest discover -s tests -v     # 24 个单测
-python3 tests/selftest_e2e.py                # 起真实子进程，31 项端到端断言
-python3 scripts/run_demo_local.py            # 本地起栈并跑完整演示
+python3 -m unittest discover -s tests -v     # 31 个单测
+python3 tests/selftest_e2e.py                # 起真实子进程，39 项端到端断言
+python3 scripts/run_demo_local.py            # 本地起栈并跑完整演示（含 3 个转发进程）
 ```
 
 端到端自测会覆盖：基本 A 转发、A/AAAA 与 A/CH 的 REFUSED、缓存命中不回源、
 8 并发 single-flight、~100ms TTL=0 旧址、后台回源续新、延迟中途改答后后台刷新到新址、
 停答→旧址→恢复改答→新址、无旧址 ~1000ms SERVFAIL、NXDOMAIN 清旧址后 SERVFAIL、
-超 grace 不用旧址、API 422 校验，以及 dnspython 的 EDNS 报文互通。
+超 grace 不用旧址、**SERVFAIL 后立即重查触发第 2 次回源（不继承死航班）**、
+**等待回源期间旧址越过宽限→继续等原回源到总限时→SERVFAIL**、
+API 422 校验，以及 dnspython 的 EDNS 报文互通。
 
 最近一次实测结果与未完成项见 **[docs/自测报告.md](docs/自测报告.md)**。
 
@@ -254,13 +269,16 @@ python3 scripts/run_demo_local.py            # 本地起栈并跑完整演示
 ## 8. 已实现功能与限制（摘要）
 
 **已做成**：题目要求的全部主路径与关键时序，均有自动化测试和实测耗时数据；
-Dockerfile / compose 文件通过 `docker compose config` 校验。
+本轮回源计时缺陷修复（统一截止时间、UDP 端点建立计入 1s、迟答不碰缓存、
+死航班不阻塞立即重查、等待中旧址失效继续等）均有针对性单测与端到端断言。
 
 **主要限制 / 未完成项**：
 
 - 本交付沙箱没有 Docker daemon 且无 root，**镜像未在此环境实际 build/up**；
-  已用等价的本机进程完成全部运行验证，compose 文件通过 v2.29.7 `config` 校验。
+  已用等价的本机进程（含 3 个转发/上游进程）完成全部运行验证，compose 文件经 YAML 解析校验。
 - 仅 UDP、仅 A/IN；非 A/IN 选择回 `REFUSED`（也可改为 `NOERROR` 空应答）。
 - 未实现 TCP/53、DNSSEC、AAAA 等其它记录的转发与完整 CNAME 链处理。
 - NXDOMAIN 立即清除旧址且不做负缓存；NODATA（NOERROR 无 A）透传空应答、不清旧址、不缓存。
 - 单进程 asyncio 模型，面向演示/小规模内网使用，未做水平扩展与安全加固（限流、ACL 等）。
+- 迟答判定基于本转发器的单调时钟与航班截止时间；若上游在截止前后各发一个重复回包，
+  截止后的那个会被记录但不影响缓存（截止前的有效回包已正常处理）。

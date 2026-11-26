@@ -381,6 +381,56 @@ def main() -> int:
                                 {"qname": n1, "ip": "not-an-ip"})
         check("非法 IP -> 422", status == 422, f"status={status}")
 
+        # ---- T11 SERVFAIL then immediate retry must re-fetch ---------------
+        print("T11 SERVFAIL 后立即重查同一域名：必须重新回源发包，不继承死航班")
+        n11 = f"retry-{run_id}.local"
+        api_request(api_base, "POST", "/admin/delay", {"delay_ms": 0})
+        api_request(api_base, "DELETE", "/admin/requests")
+        api_request(api_base, "POST", "/admin/silence", {"silence": True})
+        t0 = time.monotonic()
+        r11a = query_once(n11, port=fwd_port, timeout=2.5)
+        first_ms = (time.monotonic() - t0) * 1000
+        check("首轮停答无旧址 -> SERVFAIL(2)", r11a["ok"] and r11a["rcode"] == 2, str(r11a))
+        check("首轮等满 1s 总限时（850-1500ms）",
+              850 <= first_ms <= 1500, f"{first_ms:.0f}ms")
+        cnt1 = wait_packet_count(api_base, n11, 1, timeout=2.0)
+        check("首轮上游收到 1 个查询包", cnt1 == 1, f"count={cnt1}")
+
+        # Restore answering with a fresh address and retry at once.
+        api_request(api_base, "POST", "/admin/answer",
+                    {"qname": n11, "ip": "198.51.100.200", "ttl": 30})
+        api_request(api_base, "POST", "/admin/resume")
+        t0 = time.monotonic()
+        r11b = query_once(n11, port=fwd_port, timeout=2.5)
+        retry_ms = (time.monotonic() - t0) * 1000
+        check("立即重查成功并拿到新址",
+              r11b["ok"] and r11b["rcode"] == 0
+              and r11b["answers"] and r11b["answers"][0]["ip"] == "198.51.100.200",
+              str(r11b))
+        check("重查快速返回（<300ms，未再等 1s）", retry_ms < 300, f"{retry_ms:.0f}ms")
+        cnt2 = wait_packet_count(api_base, n11, 2, timeout=2.0)
+        check("重查使上游收到第 2 个同域名包（重新回源）", cnt2 == 2, f"count={cnt2}")
+
+        # ---- T12 stale grace expiring during the wait ----------------------
+        print("T12 等待回源期间旧址越过 30s 宽限：继续等原回源，超时报 SERVFAIL")
+        n12 = f"grace-{run_id}.local"
+        api_request(api_base, "POST", "/admin/answer",
+                    {"qname": n12, "ip": "203.0.113.66", "ttl": 1})
+        query_once(n12, port=fwd_fast_port)
+        # Expire TTL but stay inside the fast forwarder's 1s grace window for
+        # a short moment: the entry is stale-servable when the query starts and
+        # loses grace ~0.05s into the wait.
+        time.sleep(1.95)
+        api_request(api_base, "POST", "/admin/silence", {"silence": True})
+        t0 = time.monotonic()
+        r12 = query_once(n12, port=fwd_fast_port, timeout=2)
+        wait_ms = (time.monotonic() - t0) * 1000
+        api_request(api_base, "POST", "/admin/resume")
+        check("旧址宽限耗尽后不再回送 -> SERVFAIL(2)",
+              r12["ok"] and r12["rcode"] == 2 and not r12["answers"], str(r12))
+        check("继续等原回源直到 400ms 总限时（>=320ms，而非 100ms 回旧址）",
+              wait_ms >= 320, f"{wait_ms:.0f}ms")
+
         # ---- T10 real resolver library / EDNS compatibility --------------
         print("T10 dnspython（含 EDNS OPT）线路兼容性")
         try:

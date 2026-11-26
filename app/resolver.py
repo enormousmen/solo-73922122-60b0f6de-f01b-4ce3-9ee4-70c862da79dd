@@ -1,4 +1,27 @@
-"""Resolution logic: TTL cache, single-flight upstream fetches and stale fallback."""
+"""Resolution logic: TTL cache, single-flight upstream fetches and stale fallback.
+
+Timing model (all deadlines derive from one shared flight start timestamp):
+
+* ``stale_after`` (100ms): once the shared fetch has been outstanding this
+  long without a positive/definitive answer, waiters holding a still-allowed
+  stale entry receive the old addresses with TTL 0.
+* ``total_timeout`` (1s): hard cap of one upstream round, measured from the
+  moment the flight is started.  The time needed to create the upstream UDP
+  endpoint counts against this budget.  When the deadline is reached the
+  round is over for every waiter; a same-name query arriving afterwards
+  starts a brand-new flight immediately, even if the old fetch task has not
+  finished its own cleanup yet.
+* ``stale_grace`` (30s): maximum post-expiry age of an old address set.
+  Servability is re-checked at every decision point, so an entry whose grace
+  window runs out while a fetch is still outstanding is no longer served:
+  the waiter keeps waiting on the same fetch and gets SERVFAIL at the hard
+  deadline.
+
+Cache integrity: a response that arrives after the flight deadline (a late
+answer of a timed-out round) is never written to the cache and never clears
+one.  Expired-flight cleanup only removes the inflight registration when it
+still owns the slot, so it cannot disturb the next round.
+"""
 
 from __future__ import annotations
 
@@ -44,7 +67,12 @@ class Upstream(Protocol):
 
 
 class UdpUpstream:
-    """One-shot UDP DNS exchange against the configured upstream."""
+    """One-shot UDP DNS exchange against the configured upstream.
+
+    The ``timeout`` budget starts *before* the local UDP endpoint is created,
+    so endpoint setup time is included: the receive wait only gets the budget
+    remaining after the endpoint exists and the query has been sent.
+    """
 
     def __init__(self, host: str, port: int) -> None:
         self.host = host
@@ -52,6 +80,7 @@ class UdpUpstream:
 
     async def exchange(self, qname: str, timeout: float) -> DnsMessage:
         loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, timeout)
         query_id = random.randint(0, 0xFFFF)
         packet = build_query(qname, TYPE_A, CLASS_IN, msg_id=query_id)
         finished: asyncio.Future[bytes] = loop.create_future()
@@ -65,12 +94,16 @@ class UdpUpstream:
                 if not finished.done():
                     finished.set_exception(exc)
 
+        # Budget is already ticking: any time spent here is part of the round.
         transport, _proto = await loop.create_datagram_endpoint(
             _Client, remote_addr=(self.host, self.port)
         )
         try:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError()
             transport.sendto(packet)
-            data = await asyncio.wait_for(finished, timeout=timeout)
+            data = await asyncio.wait_for(finished, timeout=remaining)
             message = parse_message(data)
             if message.msg_id != query_id:
                 # A well-behaved upstream echoes the id; the one-shot socket
@@ -84,21 +117,20 @@ class UdpUpstream:
 @dataclass
 class _Flight:
     started_at: float
+    hard_deadline: float
     task: asyncio.Task[Resolution] | None = None
+    # Set once the shared hard deadline has passed.  While True the flight may
+    # still be draining in the background, but its result is dead to callers
+    # and its responses must not touch the cache.
+    expired: bool = False
 
 
 class Resolver:
     """Cache + single-flight fetch coordination.
 
-    Timing model (all deadlines derive from the shared fetch start):
-
-    * ``stale_after`` (100ms): once the shared fetch has been outstanding this
-      long without a positive/definitive answer, waiters holding a still-allowed
-      stale entry receive the old addresses with TTL 0.
-    * ``total_timeout`` (1s): hard cap of the upstream fetch.  After a stale
-      reply the caller is done but the shared task keeps running until this cap
-      so a late upstream answer can refresh the cache for the next query.
-    * ``stale_grace`` (30s): maximum post-expiry age of an old address set.
+    See the module docstring for the timing model.  In short: one flight per
+    canonical name, deadlines anchored at flight start, stale servability
+    revalidated continuously, and late responses of expired flights dropped.
     """
 
     def __init__(
@@ -129,65 +161,94 @@ class Resolver:
         if fresh is not None:
             return Resolution("fresh", fresh)
 
-        # Snapshot stale addresses for this query; failures/timeouts never
-        # mutate fetched_at so this stays valid throughout the wait.
-        stale_ips = self.cache.stale_addresses(key, self.stale_grace)
-
         flight = self._get_or_start_flight(key)
         assert flight.task is not None
         task = flight.task
-        stale_deadline = (
-            flight.started_at + self.stale_after if stale_ips is not None else None
-        )
-        hard_deadline = flight.started_at + self.total_timeout
+        stale_deadline = flight.started_at + self.stale_after
+        hard_deadline = flight.hard_deadline
 
         while True:
+            now = self._time()
+
+            # Hard cap first: this round is over.  Expire the flight (its
+            # background task may still be draining) so the next same-name
+            # query starts a fresh round immediately instead of inheriting
+            # this dead one.
+            if now >= hard_deadline:
+                flight.expired = True
+                stale = self._stale_resolution(key)
+                if stale is not None:
+                    return stale
+                return Resolution("servfail", reason="upstream total timeout")
+
             if task.done():
                 resolution = self._safe_result(task)
                 # A definitive upstream outcome is returned immediately.
                 if resolution.kind in ("fresh", "nxdomain", "nodata"):
                     return resolution
-                # Fetch failed/timed out.  With stale data, honour the 100ms
-                # threshold even if the failure arrived sooner.
-                if stale_ips is not None:
-                    now = self._time()
-                    wait = (stale_deadline or now) - now
-                    if wait > 0:
-                        await asyncio.sleep(wait)
-                    return Resolution("stale", [(ip, 0) for ip in stale_ips])
+                # Fetch failed/timed out.  Stale may only be served once the
+                # 100ms threshold has been reached, even on an instant failure.
+                if self._time() < stale_deadline:
+                    await asyncio.sleep(stale_deadline - self._time())
+                stale = self._stale_resolution(key)
+                if stale is not None:
+                    return stale
                 return resolution
 
-            now = self._time()
-            if stale_deadline is not None and now >= stale_deadline:
-                return Resolution("stale", [(ip, 0) for ip in stale_ips])
+            # Stale threshold reached: re-read the cache (the 30s grace window
+            # may have ended while we waited) and serve TTL 0 if still allowed.
+            if now >= stale_deadline:
+                stale = self._stale_resolution(key)
+                if stale is not None:
+                    return stale
+                # Stale became unservable during the wait: keep waiting on the
+                # same original fetch until its hard deadline.
 
             wait_until = hard_deadline
-            if stale_deadline is not None:
+            if self._time() < stale_deadline:
                 wait_until = min(wait_until, stale_deadline)
-            timeout = wait_until - now
+            timeout = wait_until - self._time()
             if timeout <= 0:
-                # Total upstream budget exhausted.  The fetch task itself is
-                # bounded by the same timeout and will finish/clean up.
-                if stale_ips is not None:
-                    return Resolution("stale", [(ip, 0) for ip in stale_ips])
-                return Resolution("servfail", reason="upstream total timeout")
-
+                continue
             try:
                 await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
             except asyncio.TimeoutError:
                 continue
 
+    def _stale_resolution(self, key: str) -> Resolution | None:
+        """Return a TTL-0 stale resolution *right now* if still allowed.
+
+        Unlike a one-shot snapshot taken at query entry, this re-reads the
+        cache on every decision, so entries whose 30s grace window has ended
+        (or that NXDOMAIN removed) are not served.
+        """
+        stale_ips = self.cache.stale_addresses(key, self.stale_grace)
+        if stale_ips is None:
+            return None
+        return Resolution("stale", [(ip, 0) for ip in stale_ips])
+
     def _get_or_start_flight(self, key: str) -> _Flight:
         flight = self._inflight.get(key)
-        if flight is not None and flight.task is not None and not flight.task.done():
+        if (
+            flight is not None
+            and flight.task is not None
+            and not flight.task.done()
+            and not flight.expired
+        ):
             return flight
 
-        flight = _Flight(started_at=self._time())
-        task = asyncio.create_task(self._fetch(key))
+        started_at = self._time()
+        flight = _Flight(
+            started_at=started_at,
+            hard_deadline=started_at + self.total_timeout,
+        )
+        task = asyncio.create_task(self._fetch(key, flight))
         flight.task = task
         self._inflight[key] = flight
 
         def _cleanup(_done: asyncio.Task) -> None:
+            # Only remove our own registration; a newer round must not be
+            # disturbed by this flight finishing its cleanup afterwards.
             current = self._inflight.get(key)
             if current is flight:
                 self._inflight.pop(key, None)
@@ -204,18 +265,42 @@ class Resolver:
             return Resolution("servfail", reason=f"fetch error: {exc}")
         return task.result()
 
-    async def _fetch(self, key: str) -> Resolution:
+    def _response_is_on_time(self, flight: _Flight) -> bool:
+        """Whether the flight still owns its round when the response arrives."""
+        return not flight.expired and self._time() < flight.hard_deadline
+
+    async def _fetch(self, key: str, flight: _Flight) -> Resolution:
         started = self._time()
+        # The remaining budget already excludes any scheduling/endpoint setup
+        # time elapsed since the flight was started.
+        timeout = flight.hard_deadline - started
         try:
-            message = await self.upstream.exchange(key, timeout=self.total_timeout)
+            message = await self.upstream.exchange(key, timeout=max(0.0, timeout))
         except asyncio.TimeoutError:
-            log.info("fetch %s: timeout after %.0fms", key, self.total_timeout * 1000)
+            flight.expired = True
+            log.info(
+                "fetch %s: timeout after %.0fms budget",
+                key,
+                self.total_timeout * 1000,
+            )
             return Resolution("servfail", reason="upstream timeout")
         except Exception as exc:  # network errors / decode errors must not crash loop
             log.info("fetch %s: error %r", key, exc)
             return Resolution("servfail", reason=f"upstream error: {exc}")
 
         elapsed_ms = (self._time() - started) * 1000
+
+        # Late answer of an expired round: never write to, nor clear, the
+        # cache.  Just log and drop it; the next round owns the name now.
+        if not self._response_is_on_time(flight):
+            flight.expired = True
+            log.info(
+                "fetch %s: late %s response after %.1fms discarded (round deadline passed)",
+                key,
+                message.rcode,
+                elapsed_ms,
+            )
+            return Resolution("servfail", reason="late response after round timeout")
 
         if message.rcode == 3:  # NXDOMAIN clears any old addresses
             self.cache.delete(key)

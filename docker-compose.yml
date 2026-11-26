@@ -46,6 +46,26 @@ services:
       sample-upstream:
         condition: service_healthy
 
+  # 演示用短宽限实例：grace=1s，用于展示“等待回源期间旧址越过宽限 ->
+  # 不再回旧址、继续等原回源直到总限时 -> SERVFAIL”。宿主机端口 5355。
+  dns-forwarder-fast:
+    build: .
+    image: dns-stale-fallback-demo:1.0
+    command: ["python", "-m", "app.forwarder"]
+    environment:
+      DNS_LISTEN_HOST: "0.0.0.0"
+      DNS_LISTEN_PORT: "53"
+      UPSTREAM_DNS_HOST: "sample-upstream"
+      UPSTREAM_DNS_PORT: "5353"
+      STALE_AFTER_MS: "100"
+      UPSTREAM_TIMEOUT_MS: "400"
+      STALE_GRACE_S: "1"
+    ports:
+      - "127.0.0.1:5355:53/udp"
+    depends_on:
+      sample-upstream:
+        condition: service_healthy
+
   # 可选的一键演示容器：docker compose --profile demo run --rm demo
   demo:
     build: .

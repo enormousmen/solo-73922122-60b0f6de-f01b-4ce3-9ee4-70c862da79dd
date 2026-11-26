@@ -23,6 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 UP_DNS_PORT = int(os.environ.get("LOCAL_UP_DNS_PORT", "15353"))
 FWD_DNS_PORT = int(os.environ.get("LOCAL_FWD_DNS_PORT", "15354"))
+FAST_DNS_PORT = int(os.environ.get("LOCAL_FAST_DNS_PORT", "15355"))
 API_PORT = int(os.environ.get("LOCAL_API_PORT", "18080"))
 
 
@@ -64,6 +65,20 @@ def main() -> int:
         [sys.executable, "-u", "-m", "app.forwarder"],
         cwd=REPO_ROOT, env=env, stdin=subprocess.PIPE,
     )
+    # Short-grace / short-timeout instance (mirrors the compose
+    # dns-forwarder-fast service) used by the grace-expiry demo scenario.
+    fast_env = dict(env)
+    fast_env.update(
+        {
+            "DNS_LISTEN_PORT": str(FAST_DNS_PORT),
+            "UPSTREAM_TIMEOUT_MS": "400",
+            "STALE_GRACE_S": "1",
+        }
+    )
+    fast_forwarder = subprocess.Popen(
+        [sys.executable, "-u", "-m", "app.forwarder"],
+        cwd=REPO_ROOT, env=fast_env, stdin=subprocess.PIPE,
+    )
     try:
         wait_http(f"http://127.0.0.1:{API_PORT}")
         # Give the UDP endpoints a moment; demo itself retries API only.
@@ -74,6 +89,7 @@ def main() -> int:
             {
                 "DNS_HOST": "127.0.0.1",
                 "DNS_PORT": str(FWD_DNS_PORT),
+                "FAST_DNS_PORT": str(FAST_DNS_PORT),
                 "API_BASE": f"http://127.0.0.1:{API_PORT}",
             }
         )
@@ -83,7 +99,7 @@ def main() -> int:
         )
         return result.returncode
     finally:
-        for proc in (forwarder, upstream):
+        for proc in (fast_forwarder, forwarder, upstream):
             if proc.poll() is None:
                 try:
                     proc.terminate()
